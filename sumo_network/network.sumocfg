@@ -1,0 +1,13 @@
+<sumoConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/sumoConfiguration.xsd">
+  <input>
+    <net-file value="highway.net.xml"/>
+    <route-files value="highway.rou.xml"/>
+    <additional-files value="view.settings.xml"/>
+  </input>
+  <!-- optional: set a long end time to keep GUI alive if needed -->
+  <time>
+    <begin value="0"/>
+    <end value="3600"/>  <!-- keep open for 1 hour -->
+</time>
+</sumoConfiguration>
