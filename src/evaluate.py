@@ -17,6 +17,19 @@ def compute_comprehensive_metrics(preds, gts):
     Compute comprehensive metrics beyond ADE/FDE
     preds, gts: (N, T, 2) numpy arrays
     """
+    # ---- FIX: ensure correct type and shape ----
+    preds = np.asarray(preds, dtype=np.float32)
+    gts   = np.asarray(gts,   dtype=np.float32)
+
+    if preds.ndim == 1 or gts.ndim == 1:
+        preds = np.expand_dims(preds, axis=0)
+        gts   = np.expand_dims(gts, axis=0)
+
+    # Align temporal length if needed
+    min_T = min(preds.shape[1], gts.shape[1])
+    preds = preds[:, :min_T]
+    gts   = gts[:, :min_T]
+    # --------------------------------------------
     assert preds.shape == gts.shape
     N, T, _ = preds.shape
     

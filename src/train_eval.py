@@ -48,14 +48,11 @@ def set_seed(seed=SEED):
 set_seed()
 
 if torch.backends.mps.is_available():
-    device = torch.device("mps")
-    print("Using Apple Metal (MPS)")
+    device = torch.device("cpu")
+    print("Using CPU")
 elif torch.cuda.is_available():
     device = torch.device("cuda")
     print("Using NVIDIA CUDA")
-else:
-    device = torch.device("cpu")
-    print("Using CPU")
 
 
 #  Loss: Position + Velocity + Acceleration
@@ -239,7 +236,7 @@ if __name__ == "__main__":
 
     model, history = train_loop(
         df, save_dir=args.save_dir, model_type=args.model_type,
-        curriculum=[(10,5e-4,5), (15,3e-4,10), (25,2e-4,15)],
+        curriculum=[(10, 5e-4, 4), (15, 4e-4, 6), (20, 3e-4, 8), (25, 2e-4, 10)],
         obs_len=20, batch_size=32, k_neighbors=8, val_frac=args.val_frac
     )
 
@@ -254,5 +251,5 @@ if __name__ == "__main__":
 
     print("\nStarting comprehensive evaluation...")
     metrics, pred_df = evaluate_model_comprehensive(model, df, n_samples=500,
-                                                    save_dir=os.path.join(args.save_dir, "evaluation"))
+                                                    save_dir=os.path.join(args.save_dir, "./results/eval_results"))
 
