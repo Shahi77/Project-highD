@@ -83,3 +83,29 @@ def trajectory_loss(preds_abs, gt_abs, weight_vel=0.25, weight_acc=0.1):
         mse_acc = torch.mean((acc_pred - acc_gt) ** 2)
 
     return mse_pos + weight_vel * mse_vel + weight_acc * mse_acc
+
+
+def combined_loss(pred, gt, w_pos=1.0, w_vel=0.3, w_acc=0.1):
+    """
+    Compute composite loss using position, velocity, and acceleration terms.
+    This matches the paper's multi-objective design.
+    Args:
+        pred, gt: (B, T, 2) predicted and ground truth trajectories
+        w_pos, w_vel, w_acc: weights for position, velocity, acceleration components
+    Returns:
+        total_loss, (pos_loss, vel_loss, acc_loss)
+    """
+    pos_loss = F.l1_loss(pred, gt)
+
+    # Velocity loss
+    vel_pred = pred[:, 1:] - pred[:, :-1]
+    vel_gt = gt[:, 1:] - gt[:, :-1]
+    vel_loss = F.l1_loss(vel_pred, vel_gt)
+
+    # Acceleration loss
+    acc_pred = vel_pred[:, 1:] - vel_pred[:, :-1]
+    acc_gt = vel_gt[:, 1:] - vel_gt[:, :-1]
+    acc_loss = F.l1_loss(acc_pred, acc_gt)
+
+    total_loss = w_pos * pos_loss + w_vel * vel_loss + w_acc * acc_loss
+    return total_loss, (pos_loss.item(), vel_loss.item(), acc_loss.item())

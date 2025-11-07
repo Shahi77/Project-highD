@@ -1,288 +1,154 @@
-"""
-train_fixed_optimized.py
------------------------------------------------------
-Full optimized training loop for HighD Trajectory Prediction
-
- 80/20 train/val split
- Exponential scheduled sampling
- Velocity + Acceleration loss
- Early stopping
- Extended curriculum
- Constant-velocity baseline
- Comprehensive evaluation (metrics + plots)
-"""
-
-import os
-import sys
-import time
-import json
-import random
-from collections import defaultdict
-
-import argparse
-import numpy as np
-import pandas as pd
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
-
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
+# train_eval_highd.py
+import os, json, random, numpy as np, pandas as pd, torch, torch.nn as nn
 from tqdm import tqdm
+import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt
 
-from highd_dataloader import make_dataloader_fixed
-from utils import ade_fde, cumulate_deltas, torch_cumulate_deltas, plot_prediction_one, save_json
 from models import ImprovedTrajectoryTransformer, SimpleSLSTM
-from evaluate import evaluate_model_comprehensive, compute_comprehensive_metrics
+from highd_dataloader import make_dataloader_fixed, make_dataloader_highd_multiscene
+from utils import ade_fde, combined_loss, save_json
+from evaluate import compute_comprehensive_metrics, plot_error_distribution, plot_diverse_samples
 
 
-#  General setup
+# ---------------- Setup ----------------
 SEED = 42
 def set_seed(seed=SEED):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
 set_seed()
 
-if torch.backends.mps.is_available():
-    device = torch.device("cpu")
-    print("Using CPU")
-elif torch.cuda.is_available():
-    device = torch.device("cuda")
-    print("Using NVIDIA CUDA")
+device = torch.device("cuda" if torch.cuda.is_available()
+    else "mps" if torch.backends.mps.is_available() else "cpu")
+print(f"Using device: {device}")
 
 
-#  Loss: Position + Velocity + Acceleration
-def trajectory_loss(pred, gt, alpha_v=0.2, alpha_a=0.1):
-    pos_loss = nn.functional.l1_loss(pred, gt)
-    vel_loss = nn.functional.l1_loss(pred[:,1:] - pred[:,:-1],
-                                     gt[:,1:] - gt[:,:-1])
-    acc_loss = nn.functional.l1_loss(
-        (pred[:,2:] - 2*pred[:,1:-1] + pred[:,:-2]),
-        (gt[:,2:] - 2*gt[:,1:-1] + gt[:,:-2])
-    )
-    return pos_loss + alpha_v*vel_loss + alpha_a*acc_loss
+# ---------------- Data Split ----------------
+def train_val_split(df, ratio=0.8):
+    vids = df["Vehicle_ID"].unique()
+    np.random.shuffle(vids)
+    n = int(len(vids) * ratio)
+    return df[df.Vehicle_ID.isin(vids[:n])], df[df.Vehicle_ID.isin(vids[n:])]
 
-#  Helper functions
-def split_tracks_by_vehicle(tracks_df, val_frac=0.2, seed=SEED):
-    vids = sorted(tracks_df['id'].unique())
-    random.Random(seed).shuffle(vids)
-    n_val = int(len(vids) * val_frac)
-    val_vids = set(vids[:n_val])
-    train_vids = set(vids[n_val:])
-    train_df = tracks_df[tracks_df['id'].isin(train_vids)].reset_index(drop=True)
-    val_df = tracks_df[tracks_df['id'].isin(val_vids)].reset_index(drop=True)
-    return train_df, val_df
-
-def exponential_scheduled_sampling(epoch, total_epochs, start=1.0, end=0.1, k=5):
-    return end + (start - end) * np.exp(-k * epoch / total_epochs)
-
-def constant_velocity_baseline(gt):
-    v = gt[1] - gt[0]
-    pred = gt[0] + np.arange(gt.shape[0])[:,None] * v
-    return pred
-
-
-#  Core Training Loop
-
-def evaluate_model(model, loader, device, eval_samples=200, pred_len=None, stage_idx=None):
-    """
-    Evaluate model on validation set with optional curriculum context.
-    Handles both LSTM and Transformer models safely.
-    """
-    model.eval()
-    preds_all, gts_all = [], []
-
+# ---------------- Eval Helper ----------------
+def evaluate(model, loader, name="val"):
+    model.eval(); preds, gts = [], []
     with torch.no_grad():
-        for i, sample in enumerate(loader.dataset):
-            if i >= eval_samples:
-                break
+        for b in loader:
+            obs=b["target"].to(device); fut=b["gt"].to(device)
+            nd=b["neighbors_dyn"].to(device); ns=b["neighbors_spatial"].to(device); lane=b["lane"].to(device)
+            pred,_=model(obs,nd,ns,lane) if hasattr(model,"multi_att") else (model(obs,nd,ns,lane),None)
+            preds.append(pred.cpu().numpy()); gts.append(fut.cpu().numpy())
+    preds,gts=np.concatenate(preds),np.concatenate(gts)
+    ADE,FDE=ade_fde(preds,gts)
+    print(f"{name} ADE={ADE:.3f}  FDE={FDE:.3f}")
+    return ADE,FDE,preds,gts
 
-            # Load features
-            target = torch.from_numpy(sample['target_feats']).unsqueeze(0).to(device)
-            neigh_dyn = torch.from_numpy(sample['neighbors_dyn']).unsqueeze(0).to(device)
-            neigh_spatial = torch.from_numpy(sample['neighbors_spatial']).unsqueeze(0).to(device)
-            lane = torch.from_numpy(sample['lane_feats']).unsqueeze(0).to(device)
-            gt = sample['gt']
-
-            # Determine last observed position (for residual CV baseline)
-            last_obs_pos = torch.zeros(1, 2, device=device)
-            if target.shape[1] >= 2:
-                last_obs_pos = target[:, -1, :2]
-
-            # Forward pass
-            if "train_stage" in model.forward.__code__.co_varnames:
-                # Transformer with teacher-forced CV warmup support
-                pred = model(
-                    target, neigh_dyn, neigh_spatial, lane,
-                    last_obs_pos=last_obs_pos,
-                    pred_len=pred_len,
-                    train_stage=stage_idx + 1 if stage_idx is not None else None
-                )[0].cpu().numpy()
-            else:
-                # LSTM baseline (no warmup argument)
-                pred = model(
-                    target, neigh_dyn, neigh_spatial, lane,
-                    pred_len=pred_len
-                )[0].cpu().numpy()
-
-            preds_all.append(pred)
-            gts_all.append(gt)
-
-    # Stack predictions and ground truths safely
-    preds_all = np.stack(preds_all, axis=0)
-    gts_all = np.stack(gts_all, axis=0)
-
-    # Compute all metrics
-    metrics = compute_comprehensive_metrics(preds_all, gts_all)
-    return metrics, preds_all, gts_all
-
-
-def train_loop(tracks_df, save_dir='./results/checkpoints',
-               model_type='transformer', curriculum=None,
-               obs_len=10, batch_size=32, k_neighbors=8,
-               val_frac=0.2, patience=5):
-
+# ---------------- Training ----------------
+def train_highd(csv_path, save_dir="./results_highd", model_type="transformer", train_ratio=0.8, epochs=10):
     os.makedirs(save_dir, exist_ok=True)
 
-    train_df, val_df = split_tracks_by_vehicle(tracks_df, val_frac)
-    print(f"Train vehicles: {train_df['id'].nunique()} | Val vehicles: {val_df['id'].nunique()}")
+    obs_len, pred_len, batch_size = 20, 25, 32
 
-    # Select model
-    if model_type == "lstm":
-        model = SimpleSLSTM(input_dim=7, hidden_dim=256, output_dim=2,
-                            obs_len=obs_len, pred_len=curriculum[-1][0]).to(device)
+    # --- Automatically handle single-scene or multi-scene ---
+    if os.path.isdir(csv_path):
+        from highd_dataloader import load_highd_scenes, make_dataloader_highd_multiscene
+        train_files, val_files = load_highd_scenes(csv_path, train_ratio=train_ratio)
+        train_loader = make_dataloader_highd_multiscene(train_files, batch_size, obs_len, pred_len, shuffle=True)
+        val_loader   = make_dataloader_highd_multiscene(val_files,   batch_size, obs_len, pred_len, shuffle=False)
+        print(f"Loaded {len(train_files)} training scenes and {len(val_files)} validation scenes.")
     else:
-        model = ImprovedTrajectoryTransformer(d_model=256, nhead=8, num_layers=4,
-                                              pred_len=curriculum[-1][0],
-                                              k_neighbors=k_neighbors).to(device)
+        from highd_dataloader import make_dataloader
+        train_loader = make_dataloader_highd(csv_path, batch_size=batch_size, obs_len=obs_len, pred_len=pred_len, shuffle=True)
+        val_loader   = make_dataloader_highd(csv_path, batch_size=batch_size, obs_len=obs_len, pred_len=pred_len, shuffle=False)
+        print(f"Loaded single-scene HighD file: {csv_path}")
 
-    opt = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-4)
-    scheduler = None
-    best_ade, wait = float("inf"), 0
-    history = defaultdict(list)
+    # --- Model setup ---
+    model = SimpleSLSTM(pred_len=pred_len) if model_type == "slstm" else ImprovedTrajectoryTransformer(pred_len=pred_len)
+    model.to(device)
 
-    for stage_idx, (pred_len, lr, epochs) in enumerate(curriculum):
-        print(f"\n{'='*60}\nStage {stage_idx+1}: pred_len={pred_len}, lr={lr}, epochs={epochs}\n{'='*60}")
-        for pg in opt.param_groups: pg["lr"] = lr
-        model.pred_len = pred_len
-        train_loader = make_dataloader_fixed(train_df, batch_size=batch_size, shuffle=True,
-                                             obs_len=obs_len, pred_len=pred_len, downsample=5,
-                                             k_neighbors=k_neighbors)
-        val_loader = make_dataloader_fixed(val_df, batch_size=1, shuffle=False,
-                                           obs_len=obs_len, pred_len=pred_len, downsample=5,
-                                           k_neighbors=k_neighbors)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, epochs), eta_min=lr*0.1)
+    opt = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=5e-5)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-5)
+    best_ade = float("inf"); history = {"train_loss": [], "val_loss": [], "val_ADE": []}; patience, wait = 4, 0
 
-        for epoch in range(1, epochs+1):
-            model.train()
-            total_loss = 0
-            ss_p = exponential_scheduled_sampling(epoch, epochs)
-            pbar = tqdm(train_loader, desc=f"Stage{stage_idx+1} Epoch {epoch}/{epochs}")
-            for batch in pbar:
-                target = batch["target"].to(device)
-                neigh_dyn = batch["neigh_dyn"].to(device)
-                neigh_spatial = batch["neigh_spatial"].to(device)
-                lane = batch["lane"].to(device)
-                gt = batch["gt"].to(device)
-                opt.zero_grad()
-                pred = model(target, neigh_dyn, neigh_spatial, lane, pred_len=pred_len)
-                loss = trajectory_loss(pred, gt)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt.step()
-                total_loss += loss.item()
-                pbar.set_postfix(loss=f"{loss.item():.4f}", ss_p=f"{ss_p:.2f}")
-            scheduler.step()
-            avg_loss = total_loss / len(train_loader)
-            print(f"Epoch {epoch} | Loss={avg_loss:.4f} | lr={scheduler.get_last_lr()[0]:.1e}")
+    print(f"\n Training {model_type.upper()} on HighD for {epochs} epochs ({train_ratio*100:.0f}% train / {(1-train_ratio)*100:.0f}% val)")
 
-            # Validation
-            metrics, preds, gts = evaluate_model(model, val_loader, device)
-            ADE, FDE = metrics["ADE"], metrics["FDE"]
-            print(f"Validation: ADE={ADE:.3f} FDE={FDE:.3f}")
+    for epoch in range(1, epochs + 1):
+        model.train(); epoch_loss = 0.0
 
-            history["stage"].append(stage_idx+1)
-            history["epoch"].append(epoch + sum([c[2] for c in curriculum[:stage_idx]]))
-            history["ADE"].append(ADE)
-            history["FDE"].append(FDE)
-            history["MAE"].append(metrics["MAE"])
-            history["RMSE"].append(metrics["RMSE"])
+        for b in tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}"):
+            obs = b["target"].to(device); fut = b["gt"].to(device)
+            nd = b["neighbors_dyn"].to(device); ns = b["neighbors_spatial"].to(device); lane = b["lane"].to(device)
+            opt.zero_grad()
+            pred, _ = model(obs, nd, ns, lane) if hasattr(model, "multi_att") else (model(obs, nd, ns, lane), None)
+            loss, _ = combined_loss(pred, fut, w_pos=1.0, w_vel=0.3, w_acc=0.1)
+            loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step(); epoch_loss += loss.item()
 
-            # Early stopping
-            if ADE < best_ade:
-                best_ade, wait = ADE, 0
-                torch.save(model.state_dict(), os.path.join(save_dir, "best_model.pt"))
-                print(" Best model updated.")
-            else:
-                wait += 1
-                if wait >= patience:
-                    print(" Early stopping triggered.")
-                    # break   # remove this line
-                    wait = 0  # reset patience and continue next stage
+        scheduler.step()
+        train_loss = epoch_loss / len(train_loader)
+        history["train_loss"].append(train_loss)
 
-            # Plot sample trajectory
-            sample = val_loader.dataset[0]
-            with torch.no_grad():
-                target = torch.from_numpy(sample['target_feats']).unsqueeze(0).to(device)
-                neigh_dyn = torch.from_numpy(sample['neighbors_dyn']).unsqueeze(0).to(device)
-                neigh_spatial = torch.from_numpy(sample['neighbors_spatial']).unsqueeze(0).to(device)
-                lane = torch.from_numpy(sample['lane_feats']).unsqueeze(0).to(device)
-                pred_sample = model(target, neigh_dyn, neigh_spatial, lane, pred_len=pred_len)[0].cpu().numpy()
-            plot_prediction_one(sample['target_feats'][:,:2], sample['gt'], pred_sample,
-                                save_path=os.path.join(save_dir, f"stage{stage_idx+1}_epoch{epoch:02d}.png"))
+        # ---- Validation ----
+        model.eval(); val_loss = 0.0
+        with torch.no_grad():
+            for b in val_loader:
+                obs = b["target"].to(device); fut = b["gt"].to(device)
+                nd = b["neighbors_dyn"].to(device); ns = b["neighbors_spatial"].to(device); lane = b["lane"].to(device)
+                pred, _ = model(obs, nd, ns, lane) if hasattr(model, "multi_att") else (model(obs, nd, ns, lane), None)
+                loss, _ = combined_loss(pred, fut, w_pos=1.0, w_vel=0.3, w_acc=0.1)
+                val_loss += loss.item()
+        val_loss /= len(val_loader)
+        history["val_loss"].append(val_loss)
 
+        # ---- Evaluation metrics ----
+        train_ADE, train_FDE, _, _ = evaluate(model, train_loader, "Train")
+        val_ADE, val_FDE, _, _     = evaluate(model, val_loader, "Val")
+        history["val_ADE"].append(val_ADE)
+        print(f"Epoch {epoch}: TrainLoss={train_loss:.4f}, ValLoss={val_loss:.4f}, TrainADE={train_ADE:.3f}, ValADE={val_ADE:.3f}")
+
+        # ---- Early stopping ----
+        if val_ADE < best_ade:
+            best_ade, wait = val_ADE, 0
+            torch.save(model.state_dict(), os.path.join(save_dir, f"best_{model_type}.pt"))
+        else:
+            wait += 1
         if wait >= patience:
-            break
+            print("⏸ Early stopping triggered."); break
 
+        # ---- Visualization ----
+        if epoch == epochs // 5 or epoch == epochs:
+            obs_np = obs[0, :, :2].cpu().numpy()
+            gt_np  = fut[0].cpu().numpy()
+            pred_np = pred[0].detach().cpu().numpy()
+            plt.figure(figsize=(6,5))
+            plt.plot(obs_np[:,0], obs_np[:,1], 'ko-', label='Observed')
+            plt.plot(gt_np[:,0], gt_np[:,1], 'g-', label='Ground Truth')
+            plt.plot(pred_np[:,0], pred_np[:,1], 'r--', label='Predicted')
+            plt.legend(); plt.grid(True); plt.axis('equal')
+            plt.savefig(os.path.join(save_dir, f"epoch_{epoch}_viz.png"), dpi=150)
+            plt.close()
 
-    # Save training curves
-    save_json(history, os.path.join(save_dir, "train_history.json"))
-    plt.figure(figsize=(6,4))
-    plt.plot(history["ADE"], label="ADE")
-    plt.plot(history["FDE"], label="FDE")
-    plt.xlabel("Evaluation step")
-    plt.ylabel("Error (m)")
-    plt.legend()
-    plt.title("Validation ADE/FDE over training")
-    plt.savefig(os.path.join(save_dir, "ade_fde_curve.png"), dpi=150)
-    plt.close()
-    print("Training complete. Best ADE:", best_ade)
-    return model, history
+    # ---- Final Evaluation ----
+    model.load_state_dict(torch.load(os.path.join(save_dir, f"best_{model_type}.pt"), map_location=device))
+    model.eval(); _, _, preds, gts = evaluate(model, val_loader, "Final Val")
 
+    metrics = compute_comprehensive_metrics(preds, gts)
+    print(json.dumps(metrics, indent=2))
+    save_json(metrics, os.path.join(save_dir, "metrics.json"))
+    plot_error_distribution(preds, gts, save_dir)
+    plot_diverse_samples(preds, gts, [np.zeros((obs_len, 2))]*len(preds), save_dir)
+    print(" All evaluation artifacts saved to:", save_dir)
 
-#  Main entry
+    return model, metrics
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+# ---------------- Main ----------------
+if __name__=="__main__":
+    import argparse
+    parser=argparse.ArgumentParser()
     parser.add_argument("tracks_csv")
-    parser.add_argument("--model_type", choices=["transformer", "lstm"], default="transformer")
-    parser.add_argument("--save_dir", default="./results/checkpoints")
-    parser.add_argument("--val_frac", type=float, default=0.2)
-    args = parser.parse_args()
-
-    df = pd.read_csv(args.tracks_csv)
-    print("Loaded rows:", len(df), "unique vehicles:", df["id"].nunique())
-
-    model, history = train_loop(
-        df, save_dir=args.save_dir, model_type=args.model_type,
-        curriculum=[(10, 5e-4, 4), (15, 4e-4, 6), (20, 3e-4, 8), (25, 2e-4, 10)],
-        obs_len=20, batch_size=32, k_neighbors=8, val_frac=args.val_frac
-    )
-
-    # Final Evaluation (Comprehensive)
-
-    best_model_path = os.path.join(args.save_dir, "./results/best_model.pt")
-    if os.path.exists(best_model_path):
-        print(f"\nLoading best model weights from {best_model_path}...")
-        model.load_state_dict(torch.load(best_model_path, map_location=device))
-    else:
-        print("\n[Warning] Best model checkpoint not found. Using last trained weights.")
-
-    print("\nStarting comprehensive evaluation...")
-    metrics, pred_df = evaluate_model_comprehensive(model, df, n_samples=500,
-                                                    save_dir=os.path.join(args.save_dir, "./results/eval_results"))
-
+    parser.add_argument("--model_type",choices=["transformer","slstm"],default="transformer")
+    parser.add_argument("--save_dir",default="./results_wholeDataset")
+    parser.add_argument("--train_ratio",type=float,default=0.8)
+    parser.add_argument("--epochs",type=int,default=10)
+    args=parser.parse_args()
+    train_highd(args.tracks_csv,save_dir=args.save_dir,model_type=args.model_type,
+                train_ratio=args.train_ratio,epochs=args.epochs)
