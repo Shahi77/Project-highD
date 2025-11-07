@@ -2,6 +2,69 @@
 import torch
 import torch.nn as nn
 import math
+import torch.nn.functional as F
+
+class SimpleSLSTM(nn.Module):
+    """
+    Simple Social-LSTM-like baseline.
+    Input: target sequence of shape (B, obs_len, feat_dim=7)
+    neighbors_dyn: (B, k, obs_len, feat_dim)
+    neighbors_spatial: (B, k, obs_len, 18)
+    Output: predicted displacements (B, pred_len, 2) in agent frame
+    """
+    def __init__(self, input_dim=7, hidden_dim=256, output_dim=2, obs_len=10, pred_len=25, k_neighbors=8):
+        super().__init__()
+        self.obs_len = obs_len
+        self.pred_len = pred_len
+        self.k = k_neighbors
+        self.hidden_dim = hidden_dim
+
+        # target encoder
+        self.enc = nn.LSTM(input_dim, hidden_dim, batch_first=True)
+
+        # neighbor encoder: encode each neighbor then pool (mean)
+        self.nei_enc = nn.LSTM(input_dim, hidden_dim, batch_first=True)
+
+        # decoder: simple LSTM that predicts displacement per step
+        self.dec = nn.LSTM(output_dim, hidden_dim, batch_first=True)
+        self.out = nn.Linear(hidden_dim, output_dim)
+
+        # init latent transform
+        self.init_fc = nn.Linear(hidden_dim * 2, hidden_dim)
+
+    def forward(self, target, neigh_dyn, neigh_spatial, lane, pred_len=None):
+        # target: (B, obs_len, 7)
+        B = target.shape[0]
+        pred_len = self.pred_len if pred_len is None else pred_len
+
+        _, (h_t, c_t) = self.enc(target)  # h_t: (1, B, H)
+        h_t = h_t.squeeze(0)
+        # neighbors: merge k x obs_len x 7 -> encode each neighbor then mean pool
+        Bk = neigh_dyn.shape[0]
+        if neigh_dyn.shape[1] == 0:
+            neigh_pooled = torch.zeros(B, self.hidden_dim, device=target.device)
+        else:
+            nei = neigh_dyn.view(-1, neigh_dyn.shape[2], neigh_dyn.shape[3])  # (B*k, obs, 7)
+            _, (h_n, _) = self.nei_enc(nei)
+            h_n = h_n.squeeze(0).view(B, self.k, self.hidden_dim)
+            neigh_pooled = h_n.mean(dim=1)
+
+        # fuse
+        h0 = torch.tanh(self.init_fc(torch.cat([h_t, neigh_pooled], dim=-1)))  # (B,H)
+        h0 = h0.unsqueeze(0)  # (1,B,H)
+        c0 = torch.zeros_like(h0)
+
+        # decode autoregressively starting at zero displacement
+        outputs = []
+        inp = torch.zeros(B, 1, 2, device=target.device)  # start token (0,0)
+        hx = (h0, c0)
+        for t in range(pred_len):
+            out, hx = self.dec(inp, hx)
+            step = self.out(out[:, -1, :])  # (B,2)
+            outputs.append(step.unsqueeze(1))
+            inp = step.unsqueeze(1)  # feed own prediction
+        out = torch.cat(outputs, dim=1)
+        return out  # (B, pred_len, 2)
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=500):

@@ -243,115 +243,123 @@ def plot_diverse_samples(preds, gts, obs_list, save_dir='eval_plots', n_samples=
 def evaluate_model_comprehensive(model, tracks_df, n_samples=1000, save_dir='eval_results'):
     """
     Comprehensive evaluation with all metrics and visualizations
+    Compatible with variable-length ground-truths and fixed-length predictions.
     """
     os.makedirs(save_dir, exist_ok=True)
-    
     model.eval()
-    loader = make_dataloader(
+
+    #  use correct dataloader
+    from highd_dataloader import make_dataloader_fixed
+    loader = make_dataloader_fixed(
         tracks_df, batch_size=1, shuffle=False,
         obs_len=10, pred_len=25, downsample=5, k_neighbors=8
     )
-    
+
     preds_all, gts_all, obs_all, meta_all = [], [], [], []
-    
+
     print(f"Evaluating on {min(n_samples, len(loader))} samples...")
     with torch.no_grad():
         for i, batch in enumerate(tqdm(loader, total=min(n_samples, len(loader)))):
             if i >= n_samples:
                 break
-            
-            target = batch['target'].to(next(model.parameters()).device)
-            neigh_dyn = batch['neigh_dyn'].to(next(model.parameters()).device)
-            neigh_spatial = batch['neigh_spatial'].to(next(model.parameters()).device)
-            lane = batch['lane'].to(next(model.parameters()).device)
-            gt = batch['gt'][0].cpu().numpy()
-            
+
+            target = batch["target"].to(next(model.parameters()).device)
+            neigh_dyn = batch["neigh_dyn"].to(next(model.parameters()).device)
+            neigh_spatial = batch["neigh_spatial"].to(next(model.parameters()).device)
+            lane = batch["lane"].to(next(model.parameters()).device)
+            gt = batch["gt"][0].cpu().numpy()
+
             pred = model(target, neigh_dyn, neigh_spatial, lane)[0].cpu().numpy()
-            
+
+            #  FIX: Align pred & gt lengths
+            if pred.shape[0] != gt.shape[0]:
+                min_T = min(pred.shape[0], gt.shape[0])
+                print(f"[WARN] Length mismatch at sample {i}: pred={pred.shape[0]}, gt={gt.shape[0]} → clipped to {min_T}")
+                pred = pred[:min_T]
+                gt = gt[:min_T]
+
             preds_all.append(pred)
             gts_all.append(gt)
             obs_all.append(target[0].cpu().numpy())
-            meta_all.append(batch['meta'][0])
-    
-    preds_all = np.array(preds_all)
-    gts_all = np.array(gts_all)
-    obs_all = np.array(obs_all)
-    
+            if "meta" in batch:
+                meta_all.append(batch["meta"][0])
+            else:
+                meta_all.append({"vid": i})  # fallback if meta missing
+
+    preds_all = np.array(preds_all, dtype=object)
+    gts_all = np.array(gts_all, dtype=object)
+    obs_all = np.array(obs_all, dtype=object)
+
     print("\n" + "="*60)
     print("COMPREHENSIVE EVALUATION RESULTS")
     print("="*60)
-    
-    # Compute all metrics
-    metrics = compute_comprehensive_metrics(preds_all, gts_all)
-    
-    # Print metrics
-    print(f"\n Standard Metrics:")
+
+    #  convert variable-length arrays to padded
+    max_T = min(max(gt.shape[0] for gt in gts_all), max(pred.shape[0] for pred in preds_all))
+    preds_pad = np.stack([np.pad(pred[:max_T], ((0, max_T - len(pred)), (0, 0))) for pred in preds_all])
+    gts_pad = np.stack([np.pad(gt[:max_T], ((0, max_T - len(gt)), (0, 0))) for gt in gts_all])
+
+    # Compute metrics
+    metrics = compute_comprehensive_metrics(preds_pad, gts_pad)
+
+    # Print summary
+    print(f"\nStandard Metrics:")
     print(f"  ADE: {metrics['ADE']:.4f} m")
     print(f"  FDE: {metrics['FDE']:.4f} m")
     print(f"  MAE: {metrics['MAE']:.4f} m")
     print(f"  RMSE: {metrics['RMSE']:.4f} m")
-    
-    print(f"\n Motion Metrics:")
+
+    print(f"\nMotion Metrics:")
     print(f"  Velocity Error: {metrics['Velocity_Error']:.4f} m/s")
     print(f"  Acceleration Error: {metrics['Acceleration_Error']:.4f} m/s²")
     print(f"  Direction Error: {metrics['Direction_Error_deg']:.2f}°")
-    
-    print(f"\n Spatial Breakdown:")
+
+    print(f"\nSpatial Breakdown:")
     print(f"  Longitudinal Error: {metrics['Longitudinal_Error']:.4f} m")
     print(f"  Lateral Error: {metrics['Lateral_Error']:.4f} m")
-    
-    print(f"\n  Quality Checks:")
+
+    print(f"\nQuality Checks:")
     print(f"  Miss Rate (>2m): {metrics['Miss_Rate_%']:.2f}%")
     print(f"  Variance Ratio: {metrics['Variance_Ratio']:.4f}")
-    
-    # WARNING: Check for model collapse
+
     if metrics['Variance_Ratio'] < 0.1:
-        print("\n WARNING: MODEL COLLAPSE DETECTED!")
-        print("   Predicted trajectories have very low variance.")
-        print("   Model is likely predicting near-constant values.")
-        print("   → Need to increase diversity in predictions!")
+        print("\n  MODEL COLLAPSE DETECTED! Very low variance.")
     elif metrics['Variance_Ratio'] < 0.5:
-        print("\n  WARNING: Low prediction diversity")
-        print("   Consider adding diversity loss or increasing model capacity")
+        print("\n  Low prediction diversity.")
     else:
-        print("\n Prediction diversity looks healthy")
-    
-    # Save metrics to JSON
-    with open(os.path.join(save_dir, 'metrics.json'), 'w') as f:
+        print("\n Prediction diversity looks healthy.")
+
+    # Save metrics
+    with open(os.path.join(save_dir, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
-    
-    # Generate visualizations
-    print(f"\nGenerating diagnostic plots...")
-    plot_error_distribution(preds_all, gts_all, save_dir)
-    plot_diverse_samples(preds_all, gts_all, obs_all, save_dir, n_samples=9)
-    
+
+    # Generate plots
+    print("\nGenerating diagnostic plots...")
+    plot_error_distribution(preds_pad, gts_pad, save_dir)
+    plot_diverse_samples(preds_pad, gts_pad, obs_all, save_dir, n_samples=9)
+
     # Save predictions CSV
-    print(f"\nSaving predictions CSV...")
-    pred_df = save_predictions_csv(preds_all, gts_all, meta_all, 
-                                   save_path=os.path.join(save_dir, 'predictions.csv'))
-    
+    print("\nSaving predictions CSV...")
+    pred_df = save_predictions_csv(preds_pad, gts_pad, meta_all,
+                                   save_path=os.path.join(save_dir, "predictions.csv"))
+
     # Compare with paper benchmarks
-    print(f"\n" + "="*60)
+    print("\n" + "="*60)
     print("COMPARISON WITH PAPER (INTERACTION Dataset)")
     print("="*60)
-    paper_ade_interaction = 1.5  # approximate from paper
+    paper_ade_interaction = 1.5
     paper_fde_interaction = 3.0
-    
     print(f"  Paper ADE: ~{paper_ade_interaction:.2f}m  |  Your ADE: {metrics['ADE']:.4f}m")
     print(f"  Paper FDE: ~{paper_fde_interaction:.2f}m  |  Your FDE: {metrics['FDE']:.4f}m")
-    
     if metrics['ADE'] < paper_ade_interaction:
-        print(f"\n Your ADE is better (but HighD is simpler than INTERACTION)")
-    
-    print(f"\nNotes:")
-    print(f"  - HighD (highway) is simpler than INTERACTION (urban)")
-    print(f"  - Your low errors might indicate straight-line predictions")
-    print(f"  - Check variance ratio and visual plots for true performance")
-    
-    print(f"\n" + "="*60)
-    print(f"Evaluation complete! Results saved to {save_dir}/")
+        print("Your ADE is better (HighD easier than INTERACTION).")
+
+    print("\nNotes:")
+    print("  - HighD = highway (straight-line), simpler than urban.")
+    print("  - Low variance or perfect straight lines can indicate over-simplification.")
+    print(f"\nEvaluation complete! Results saved to {save_dir}/")
     print("="*60)
-    
+
     return metrics, pred_df
 
 if __name__ == '__main__':
@@ -379,4 +387,4 @@ if __name__ == '__main__':
     ).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     
-    evaluate_model_comprehensive(model, df, n_samples=1000, save_dir='eval_results')
+    evaluate_model_comprehensive(model, df, n_samples=1000, save_dir='./results/eval_results')
