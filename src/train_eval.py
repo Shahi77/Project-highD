@@ -1,27 +1,70 @@
-# train_eval_highd.py
+# train_eval.py
+"""
+HighD Training and Evaluation Script
+------------------------------------
+• Automatically detects single- or multi-scene datasets
+• Supports both Transformer and S-LSTM architectures
+• Includes CV residual warm-up for Transformer
+• Handles early stopping and adaptive learning rate scheduling
+• Outputs full evaluation metrics and plots
+"""
+
 import os, json, random, numpy as np, pandas as pd, torch, torch.nn as nn
 from tqdm import tqdm
-import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from models import ImprovedTrajectoryTransformer, SimpleSLSTM
 from utils import ade_fde, combined_loss, save_json
 from evaluate import compute_comprehensive_metrics, plot_error_distribution, plot_diverse_samples
 from highd_dataloader import make_dataloader_highd, load_highd_scenes, make_dataloader_highd_multiscene
 
-# ---------------- Setup ----------------
+
+# -------------------- Setup --------------------
 SEED = 42
 def set_seed(seed=SEED):
-    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
-    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 set_seed()
 
-device = torch.device("cuda" if torch.cuda.is_available()
-    else "mps" if torch.backends.mps.is_available() else "cpu")
+device = torch.device(
+    "cuda" if torch.cuda.is_available()
+    else "mps" if torch.backends.mps.is_available()
+    else "cpu"
+)
 print(f"Using device: {device}")
 
-# ---------------- Eval Helper ----------------
+
+# -------------------- Forward Wrapper --------------------
+def forward_model(model, obs, nd, ns, lane, teacher_forced=False):
+    """
+    Unified forward pass for both models.
+    Includes teacher-forced CV residual warm-up for transformer.
+    """
+    if hasattr(model, "multi_att"):  # Transformer
+        last_obs_pos = obs[:, -1, :2]
+        pred = model(obs, nd, ns, lane, last_obs_pos=last_obs_pos)
+        if teacher_forced:
+            # Residual warm-up (CV baseline blending)
+            with torch.no_grad():
+                v_last = obs[:, -1, 2:4]  # last observed velocity
+                t = torch.arange(model.pred_len, device=obs.device).float().view(1, -1, 1)
+                cv_baseline = last_obs_pos.unsqueeze(1) + t * v_last.unsqueeze(1)
+            alpha = 0.1  # blending ratio
+            pred = (1 - alpha) * pred + alpha * cv_baseline
+        return pred
+    else:  # SLSTM
+        return model(obs, nd, ns, lane)
+
+
+# -------------------- Evaluation Helper --------------------
 def evaluate(model, loader, name="val"):
-    model.eval(); preds, gts = [], []
+    model.eval()
+    preds, gts = [], []
     with torch.no_grad():
         for b in loader:
             obs = b["target"].to(device)
@@ -29,7 +72,7 @@ def evaluate(model, loader, name="val"):
             nd = b["neighbors_dyn"].to(device)
             ns = b["neighbors_spatial"].to(device)
             lane = b["lane"].to(device)
-            pred, _ = model(obs, nd, ns, lane) if hasattr(model, "multi_att") else (model(obs, nd, ns, lane), None)
+            pred = forward_model(model, obs, nd, ns, lane)
             preds.append(pred.cpu().numpy())
             gts.append(fut.cpu().numpy())
     preds, gts = np.concatenate(preds), np.concatenate(gts)
@@ -37,19 +80,26 @@ def evaluate(model, loader, name="val"):
     print(f"{name} ADE={ADE:.3f}  FDE={FDE:.3f}")
     return ADE, FDE, preds, gts
 
-# ---------------- Training ----------------
+
+# -------------------- Training Core --------------------
 def train_highd(csv_path, save_dir="./results_highd", model_type="transformer",
                 train_ratio=0.8, epochs=10):
     os.makedirs(save_dir, exist_ok=True)
-
     obs_len, pred_len, batch_size = 20, 25, 32
 
-    # --- Automatically handle single-scene or multi-scene ---
+    # --- Automatic multi-scene detection ---
     if os.path.isdir(csv_path):
         train_files, val_files = load_highd_scenes(csv_path, train_ratio=train_ratio)
-        train_loader = make_dataloader_highd_multiscene(train_files, batch_size, obs_len, pred_len, shuffle=True)
-        val_loader   = make_dataloader_highd_multiscene(val_files,   batch_size, obs_len, pred_len, shuffle=False)
-        print(f"Loaded {len(train_files)} training scenes and {len(val_files)} validation scenes.")
+        train_loader = make_dataloader_highd_multiscene(
+            train_files, batch_size, obs_len, pred_len,
+            shuffle=True, num_workers=4, pin_memory=True
+        )
+        val_loader = make_dataloader_highd_multiscene(
+            val_files, batch_size, obs_len, pred_len,
+            shuffle=False, num_workers=2, pin_memory=True
+        )
+
+        print(f"Detected {len(train_files) + len(val_files)} scenes → train={len(train_files)}, val={len(val_files)}")
     else:
         res = make_dataloader_highd(csv_path, batch_size=batch_size,
                                     obs_len=obs_len, pred_len=pred_len, shuffle=True)
@@ -74,9 +124,11 @@ def train_highd(csv_path, save_dir="./results_highd", model_type="transformer",
 
     print(f"\nTraining {model_type.upper()} on HighD for {epochs} epochs ({train_ratio*100:.0f}% train / {(1-train_ratio)*100:.0f}% val)\n")
 
+    # --- Epoch Loop ---
     for epoch in range(1, epochs + 1):
         model.train()
         epoch_loss = 0.0
+
         for b in tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}"):
             obs = b["target"].to(device)
             fut = b["gt"].to(device)
@@ -85,7 +137,8 @@ def train_highd(csv_path, save_dir="./results_highd", model_type="transformer",
             lane = b["lane"].to(device)
 
             opt.zero_grad()
-            pred, _ = model(obs, nd, ns, lane) if hasattr(model, "multi_att") else (model(obs, nd, ns, lane), None)
+            teacher_forced = hasattr(model, "multi_att") and epoch == 1  # Only warm-up for transformer stage 1
+            pred = forward_model(model, obs, nd, ns, lane, teacher_forced=teacher_forced)
             loss, _ = combined_loss(pred, fut, w_pos=1.0, w_vel=0.3, w_acc=0.1)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -106,31 +159,32 @@ def train_highd(csv_path, save_dir="./results_highd", model_type="transformer",
                 nd = b["neighbors_dyn"].to(device)
                 ns = b["neighbors_spatial"].to(device)
                 lane = b["lane"].to(device)
-                pred, _ = model(obs, nd, ns, lane) if hasattr(model, "multi_att") else (model(obs, nd, ns, lane), None)
+                pred = forward_model(model, obs, nd, ns, lane)
                 loss, _ = combined_loss(pred, fut, w_pos=1.0, w_vel=0.3, w_acc=0.1)
                 val_loss += loss.item()
         val_loss /= len(val_loader)
         history["val_loss"].append(val_loss)
 
-        # ---- Evaluation metrics ----
+        # ---- Evaluation Metrics ----
         train_ADE, train_FDE, _, _ = evaluate(model, train_loader, "Train")
         val_ADE, val_FDE, _, _ = evaluate(model, val_loader, "Val")
         history["val_ADE"].append(val_ADE)
         print(f"Epoch {epoch}: TrainLoss={train_loss:.4f}, ValLoss={val_loss:.4f}, TrainADE={train_ADE:.3f}, ValADE={val_ADE:.3f}")
 
-        # ---- Early stopping ----
+        # ---- Early Stopping ----
         if val_ADE < best_ade:
             best_ade, wait = val_ADE, 0
             torch.save(model.state_dict(), os.path.join(save_dir, f"best_{model_type}.pt"))
         else:
             wait += 1
         if wait >= patience:
-            print("⏸ Early stopping triggered."); break
+            print("⏸ Early stopping triggered.")
+            break
 
         # ---- Visualization ----
-        if epoch == epochs // 5 or epoch == epochs:
+        if epoch in {1, epochs // 2, epochs}:
             obs_np = obs[0, :, :2].cpu().numpy()
-            gt_np = fut[0].cpu().numpy()
+            gt_np  = fut[0].cpu().numpy()
             pred_np = pred[0].detach().cpu().numpy()
             plt.figure(figsize=(6, 5))
             plt.plot(obs_np[:, 0], obs_np[:, 1], "ko-", label="Observed")
@@ -149,12 +203,13 @@ def train_highd(csv_path, save_dir="./results_highd", model_type="transformer",
     print(json.dumps(metrics, indent=2))
     save_json(metrics, os.path.join(save_dir, "metrics.json"))
     plot_error_distribution(preds, gts, save_dir)
-    plot_diverse_samples(preds, gts, [np.zeros((obs_len, 2))]*len(preds), save_dir)
+    plot_diverse_samples(preds, gts, [np.zeros((obs_len, 2))] * len(preds), save_dir)
     print(f"All evaluation artifacts saved to: {save_dir}")
 
     return model, metrics
 
-# ---------------- Main ----------------
+
+# -------------------- Main Entry --------------------
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
@@ -170,5 +225,5 @@ if __name__ == "__main__":
         save_dir=args.save_dir,
         model_type=args.model_type,
         train_ratio=args.train_ratio,
-        epochs=args.epochs
+        epochs=args.epochs,
     )
