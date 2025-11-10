@@ -2,7 +2,7 @@ import pandas as pd
 import glob
 import os
 
-path = "../data"
+path = "../data/highd/dataset"
 all_files = glob.glob(os.path.join(path, "*_tracksMeta.csv"))
 
 merged_data = pd.concat((pd.read_csv(f) for f in all_files), ignore_index=True)

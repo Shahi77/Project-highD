@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<viewsettings>
+    <scheme name="real world">
+        <opengl antialiase="1" dither="1"/>
+    </scheme>
+    <viewport zoom="500" x="2000" y="10" angle="0"/>
+    <delay value="20"/>
+</viewsettings>

@@ -29,7 +29,11 @@ else:
 
 import sumolib
 import traci
-from plexe import POS_X, POS_Y, ENGINE_MODEL_REALISTIC
+# Replace Plexe constants with normal TraCI placeholders
+POS_X = "x"
+POS_Y = "y"
+ENGINE_MODEL_REALISTIC = None  # unused, keep placeholder
+
 
 
 # lane change state bits
