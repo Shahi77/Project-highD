@@ -40,7 +40,7 @@ def load_model(model_path, model_type="slstm", pred_len=25):
     model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
-    print(f"✓ Loaded {model_type.upper()} model\n")
+    print(f"Loaded {model_type.upper()} model\n")
     return model
 
 
@@ -136,7 +136,7 @@ def main():
             pred_len=25,
             shuffle=False
         )
-        print(f"✓ Loaded dataloader\n")
+        print(f"Loaded dataloader\n")
     except Exception as e:
         print(f"✗ Error loading dataloader: {e}")
         print("Trying directory path...")
@@ -173,7 +173,7 @@ def main():
                     pred = model(obs, nd, ns, lane)
             
             # Convert to numpy
-            obs_np = obs[0, :, :2].cpu().numpy()  # Take only x, y
+            obs_np = obs[0].cpu().numpy()  # Take only x, y
             gt_np = gt[0].cpu().numpy()
             pred_np = pred[0].cpu().numpy()
             
@@ -185,15 +185,15 @@ def main():
             visualize_trajectory(obs_np, pred_np, gt_np, batch_idx, lane_id, save_path)
             
             viz_count += 1
-            print(f"  ✓ [{viz_count}/{NUM_VIZ}] Generated: trajectory_batch_{batch_idx}.png")
+            print(f"[{viz_count}/{NUM_VIZ}] Generated: trajectory_batch_{batch_idx}.png")
             
         except Exception as e:
-            print(f"  ✗ Error with batch {batch_idx}: {e}")
+            print(f"Error with batch {batch_idx}: {e}")
             continue
     
     print(f"\n{'='*60}")
-    print(f"✓ Generated {viz_count} trajectory visualizations")
-    print(f"✓ Saved to: {SAVE_DIR}")
+    print(f"Generated {viz_count} trajectory visualizations")
+    print(f"Saved to: {SAVE_DIR}")
     print(f"{'='*60}\n")
 
 
